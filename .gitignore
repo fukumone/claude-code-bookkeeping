@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# 個人の Claude Code 設定
+.claude/settings.local.json
+
+# マイナンバー入りの書類はgitに入れない（ローカル保管のみ）
+*個人番号あり*

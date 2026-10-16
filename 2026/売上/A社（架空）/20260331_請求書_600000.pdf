@@ -1,0 +1,40 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 226 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+5 0 obj
+<< /Length 269 >>
+stream
+BT /F1 9 Tf 12 TL 14 276 Td
+(DUMMY INVOICE \(SAMPLE DATA\)) Tj T*
+(This is not a real invoice.) Tj T*
+(--------------------------------) Tj T*
+(Billing month: 2026-03) Tj T*
+(Issued: 2026-03-31) Tj T*
+(Due: 2026-04-30) Tj T*
+(Amount: JPY 600,000 \(tax incl.\)) Tj T*
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000309 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+629
+%%EOF

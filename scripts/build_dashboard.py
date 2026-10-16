@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+"""確定申告ダッシュボード（dashboard.html）を生成する。
+
+使い方:
+    python3 scripts/build_dashboard.py          # 売上高_YYYY.csv がある最新の年
+    python3 scripts/build_dashboard.py 2026     # 年を指定する
+
+読み込み元（すべて既存のCSV。ここでは一切書き換えない）:
+    YYYY/売上高_YYYY.csv                  月別・取引先別の売上（税込）
+    YYYY/管理台帳_YYYY.csv                勘定科目別の月次推移（rebuild_ledger.py が作る）
+    YYYY/確定申告サマリー_YYYY.csv        所得控除・地代家賃・按分率・減価償却などの確定値
+    YYYY/定期経費_YYYY.csv                領収書が届かない定期の経費（任意）
+    YYYY/寄付金/寄付金_YYYY.csv           ふるさと納税などの寄附（任意）
+    YYYY/帳簿/手入力仕訳_YYYY.csv         前年分の消費税の納付など、ほかにない経費（任意）
+
+消費税は税込経理で、納めた年の経費（租税公課）として扱う（帳簿と同じ）。
+今年分の消費税は税負担には入れるが、今年の経費には入れない。
+
+仕分け（/sorting-receipt-images）や台帳再集計（rebuild_ledger.py）のあとに
+実行すると、ダッシュボードが最新の数字に追従する。
+値が1つでも読めなければ何も書かずに中止する（古い数字を残さないため）。
+"""
+
+import csv
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # scripts/__pycache__ を作らない
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 速算表・復興特別所得税の率・みなし仕入率は帳簿の転記シートと共通（scripts/tax_rules.py）
+from tax_rules import (DEEMED_PURCHASE_RATE, INCOME_TAX_TABLE,  # noqa: E402
+                       RECONSTRUCTION_PERMILLE)
+from build_books import kind_of  # noqa: E402  勘定科目の区分は帳簿と共通
+
+ROOT = Path(__file__).resolve().parent.parent
+OUT = ROOT / "dashboard.html"
+
+MONTHS = [f"{m}月" for m in range(1, 13)]
+
+# 取引終了が決まっている売上先 → 最終の月度（その月度までは売上が立つ）。
+# 年間着地の見込みで、翌月以降のこの売上先を0として扱う。例: {"B社（架空）": 9}
+CLIENT_END_MONTH = {}
+# 管理台帳では家事分を含む総額で持っている科目 → 事業按分率を読むサマリーのセクション
+PRORATED = {"水道光熱費": "水道光熱費"}
+# 住民税の前提（令和8年度）。税制が変わったら CLAUDE.md の「税制パラメータ」表と一緒に直す
+JUMIN = {"rate": 10,          # 所得割（%）
+         "kiso": 430_000,     # 基礎控除（所得税とは額が違う）
+         "adjust": 2_500,     # 調整控除（簡略化。課税所得200万円超で人的控除の差が基礎控除だけの場合）
+         "kintou": 5_000}     # 均等割の標準額（森林環境税1,000円を含む。自治体によって加算がある）
+
+
+def die(msg):
+    sys.exit(f"中止: {msg}\n（ダッシュボードは更新していません）")
+
+
+def rel(path):
+    return path.relative_to(ROOT)
+
+
+def read_rows(path):
+    if not path.exists():
+        die(f"{rel(path)} が見つからない")
+    with path.open(encoding="utf-8") as fh:
+        return [r for r in csv.reader(fh)]
+
+
+def to_int(s):
+    s = (s or "").replace(",", "").replace("¥", "").replace("%", "").strip()
+    return int(s) if re.fullmatch(r"-?\d+", s) else None
+
+
+def pick_year():
+    args = sys.argv[1:]
+    if len(args) > 1 or (args and not re.fullmatch(r"\d{4}", args[0])):
+        sys.exit(__doc__)
+    if args:
+        return int(args[0])
+    years = sorted(int(p.parent.name) for p in ROOT.glob("[0-9][0-9][0-9][0-9]/売上高_*.csv"))
+    if not years:
+        die("売上高_YYYY.csv が1つもない")
+    return years[-1]
+
+
+# ---------------------------------------------------------------- 売上
+def load_sales(year):
+    path = ROOT / f"{year}/売上高_{year}.csv"
+    rows = read_rows(path)
+    clients = rows[0][1:-1]
+    months, total = [], 0
+    for r in rows[1:]:
+        m = re.match(rf"{year}/(\d\d)$", r[0]) if r else None
+        if not m:
+            continue
+        vals = [to_int(x) or 0 for x in r[1:1 + len(clients)]]
+        months.append({"month": int(m.group(1)), "values": vals, "total": to_int(r[-1]) or 0})
+        total += to_int(r[-1]) or 0
+    if not months:
+        die(f"{rel(path)} から月次売上を読めない")
+    posted = [m for m in months if m["total"] > 0]
+    for name in CLIENT_END_MONTH:
+        if name not in clients:
+            die(f"CLIENT_END_MONTH の『{name}』が {rel(path)} の売上先にない")
+    return {"clients": clients, "months": months, "total": total,
+            "endMonth": [CLIENT_END_MONTH.get(c) for c in clients],
+            "postedMonths": len(posted),
+            "lastMonth": max((m["month"] for m in posted), default=0)}
+
+
+# ---------------------------------------------------------------- 経費
+def load_expenses(year, prorate):
+    path = ROOT / f"{year}/管理台帳_{year}.csv"
+    rows = read_rows(path)
+    try:
+        start = next(i for i, r in enumerate(rows)
+                     if r and r[0].startswith("【勘定科目別 月次推移】"))
+    except StopIteration:
+        die(f"{rel(path)} に『勘定科目別 月次推移』が見つからない")
+    cats = []
+    for r in rows[start + 2:]:
+        if not r or not r[0] or r[0].startswith("【") or r[0] == "月合計":
+            break
+        vals = [to_int(x) or 0 for x in r[1:13]]
+        cats.append({"name": r[0], "monthly": vals, "total": sum(vals),
+                     "prorate": prorate.get(r[0])})
+    if not cats:
+        die(f"{rel(path)} から勘定科目別の月次推移を読めない")
+    return cats
+
+
+# ---------------------------------------------------------------- 控除など
+class Summary:
+    """確定申告サマリーを『【セクション】』ごとに『ラベル,値』で読む（build_books.py と同じ形式）。"""
+
+    def __init__(self, year):
+        self.path = ROOT / f"{year}/確定申告サマリー_{year}.csv"
+        self.rows = read_rows(self.path)
+
+    def value(self, section, label):
+        inside = False
+        for r in self.rows:
+            if r and r[0].startswith("【"):
+                inside = r[0].startswith(f"【{section}")
+                continue
+            if inside and len(r) >= 2 and (r[0] == label or r[0].startswith(label + "（")):
+                v = to_int(r[1])
+                if v is not None:
+                    return v
+        die(f"{rel(self.path)} の【{section}】に『{label}』の値が見つからない")
+
+
+def load_summary(year):
+    s = Summary(year)
+    rent, rent_pct = s.value("地代家賃", "家賃月額（総額）"), s.value("地代家賃", "事業按分率")
+    return {
+        "shakai": s.value("社会保険料控除", "社会保険料控除合計"),
+        "kakekin": s.value("小規模企業共済等掛金控除", "小規模企業共済等掛金控除合計"),
+        "iryo": s.value("医療費控除", "控除対象額"),
+        "fuyo": s.value("専従者給与・扶養控除", "扶養控除（所得税）"),
+        "fuyoR": s.value("専従者給与・扶養控除", "扶養控除（住民税）"),
+        "kiso": s.value("基礎控除", "基礎控除"),
+        "rentMonth": (rent * rent_pct + 50) // 100,  # 事業分の月額（1円未満四捨五入）
+        "genka": s.value("固定資産・減価償却", f"{year}年減価償却費"),
+        "aoiro": s.value("青色申告特別控除", "青色申告特別控除"),
+    }, {name: s.value(section, "事業按分率") for name, section in PRORATED.items()}
+
+
+def load_recurring(year):
+    """定期経費_YYYY.csv（任意）を月ごとに合計する。最後の月の額がこの先も続くとみなして年間見込みを出す。"""
+    path = ROOT / f"{year}/定期経費_{year}.csv"
+    monthly = {}
+    if path.exists():
+        for r in read_rows(path)[1:]:
+            m = re.fullmatch(r"(\d{1,2})月", r[0].strip()) if r and r[0].strip() else None
+            if not m:
+                continue
+            v = to_int(r[1]) if len(r) > 1 else None
+            if v is None:
+                die(f"{rel(path)} の {r[0]} の金額が読めない")
+            monthly[int(m.group(1))] = monthly.get(int(m.group(1)), 0) + v
+    total = sum(monthly.values())
+    per = monthly[max(monthly)] if monthly else 0
+    return {"monthly": monthly, "total": total, "months": len(monthly), "perMonth": per,
+            "projected": total + per * (12 - max(monthly, default=0))}
+
+
+def load_donations(year):
+    """寄付金_YYYY.csv（任意）の件数と合計。列: No,寄付日,寄付先,金額,…"""
+    path = ROOT / f"{year}/寄付金/寄付金_{year}.csv"
+    count = total = 0
+    if path.exists():
+        for r in read_rows(path)[1:]:
+            if r and re.fullmatch(r"\d+", r[0].strip()):
+                v = to_int(r[3]) if len(r) > 3 else None
+                if v is None:
+                    die(f"{rel(path)} の No.{r[0]} の金額が読めない")
+                count, total = count + 1, total + v
+    return {"count": count, "total": total}
+
+
+def load_manual(year):
+    """手入力仕訳_YYYY.csv（任意）のうち経費になる分（借方が費用の科目）を、月ごとに合計する。"""
+    path = ROOT / f"{year}/帳簿/手入力仕訳_{year}.csv"
+    monthly = {}
+    if path.exists():
+        for r in read_rows(path)[1:]:
+            if not r or not r[0].strip() or r[0].startswith("※"):
+                continue
+            m = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", r[0].strip())
+            v = to_int(r[3]) if len(r) > 3 else None
+            if not m or v is None:
+                die(f"{rel(path)} の行が読めない: {','.join(r)}")
+            sign = (kind_of(r[1].strip()) == "費用") - (kind_of(r[2].strip()) == "費用")
+            if sign:
+                monthly[int(m.group(2))] = monthly.get(int(m.group(2)), 0) + sign * v
+    return {"monthly": monthly, "total": sum(monthly.values())}
+
+
+def main():
+    year = pick_year()
+    sales = load_sales(year)
+    deductions, prorate = load_summary(year)
+    cats = load_expenses(year, prorate)
+    recurring = load_recurring(year)
+    donations = load_donations(year)
+    manual = load_manual(year)
+
+    data = {
+        "year": year,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "sales": sales,
+        "expenseCats": cats,
+        "deductions": deductions,
+        "recurring": recurring,
+        "furusato": donations,
+        "manual": manual,
+        "months": MONTHS,
+        "tax": {"table": INCOME_TAX_TABLE, "reconstructionPermille": RECONSTRUCTION_PERMILLE,
+                "deemedPurchaseRate": DEEMED_PURCHASE_RATE, "jumin": JUMIN},
+    }
+
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    OUT.write_text(TEMPLATE.replace("/*__DATA__*/null", payload), encoding="utf-8")
+    print(f"{rel(OUT)} を生成しました（{year}年分）")
+    print(f"  売上 1-{sales['lastMonth']}月: {sales['total']:,}円（税込）")
+    print(f"  経費 台帳計上: {sum(c['total'] for c in cats):,}円")
+    print(f"  定期経費: {recurring['total']:,}円（{recurring['months']}か月）→ 年間見込 {recurring['projected']:,}円")
+    print(f"  寄附: {donations['total']:,}円（{donations['count']}件）")
+    print(f"  手入力仕訳の経費: {manual['total']:,}円")
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>確定申告シミュレーター</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&family=Noto+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{color-scheme:light dark;
+  --paper:#faf8f4; --surface:#ffffff; --sunk:#f2efe8;
+  --ink:#1f2733; --ink-2:#4e5a6b; --ink-3:#818d9d;
+  --rule:#e0dbd0; --rule-2:#cdc6b8;
+  --seal:#b03a30; --moss:#3f6b52; --indigo:#2f4d7a; --ochre:#9a7326;
+  --accent:var(--indigo);
+}
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+  --paper:#15181d; --surface:#1c2028; --sunk:#232832;
+  --ink:#e8e4db; --ink-2:#a8b1bf; --ink-3:#76808f;
+  --rule:#2e343f; --rule-2:#3c434f;
+  --seal:#e07263; --moss:#7bb491; --indigo:#8ab0e0; --ochre:#d1a75a;
+}}
+:root[data-theme="dark"]{
+  --paper:#15181d; --surface:#1c2028; --sunk:#232832;
+  --ink:#e8e4db; --ink-2:#a8b1bf; --ink-3:#76808f;
+  --rule:#2e343f; --rule-2:#3c434f;
+  --seal:#e07263; --moss:#7bb491; --indigo:#8ab0e0; --ochre:#d1a75a;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font-family:"Noto Sans JP",system-ui,sans-serif;line-height:1.7;
+  font-size:15px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1500px;margin:0 auto;padding-inline:24px;padding-block:0 72px}
+@media(max-width:560px){.wrap{padding-inline:16px}}
+h1,h2,h3{font-family:"Shippori Mincho",serif;font-weight:700;
+  text-wrap:balance;margin:0;letter-spacing:.02em}
+.num{font-family:"IBM Plex Mono",ui-monospace,monospace;
+  font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+
+/* ---- header ---- */
+header{border-bottom:2px solid var(--ink);margin-bottom:34px;
+  padding-block:44px 16px;display:flex;flex-wrap:wrap;
+  align-items:flex-end;gap:16px;justify-content:space-between}
+header h1{font-size:clamp(28px,5.2vw,42px);line-height:1.2}
+.eyebrow{font-size:11px;letter-spacing:.22em;color:var(--seal);
+  font-weight:700;margin-bottom:8px}
+.stamp{border:1.5px solid var(--seal);color:var(--seal);border-radius:3px;
+  padding:5px 11px;font-size:11px;font-weight:700;letter-spacing:.09em;
+  white-space:nowrap;line-height:1.5;text-align:center}
+
+/* ---- section ---- */
+section{margin-bottom:46px;scroll-margin-top:16px}
+.shead{display:flex;align-items:baseline;gap:12px;margin-bottom:16px;
+  border-bottom:1px solid var(--rule-2);padding-bottom:7px}
+.shead h2{font-size:19px}
+.shead .note{font-size:12px;color:var(--ink-3);margin-left:auto;text-align:right}
+
+/* ---- headline figures ---- */
+.figs{display:grid;gap:1px;background:var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  border:1px solid var(--rule)}
+.fig{background:var(--surface);padding:16px 17px 14px}
+.fig .k{font-size:11px;color:var(--ink-3);letter-spacing:.09em;font-weight:500}
+.fig .v{font-size:clamp(20px,3.3vw,27px);font-weight:600;margin-top:5px;
+  line-height:1.15}
+.fig .s{font-size:11.5px;color:var(--ink-3);margin-top:4px}
+.fig.hl{background:var(--sunk)}
+.fig.hl .v{color:var(--moss)}
+.fig.tax .v{color:var(--seal)}
+
+/* ---- tables ---- */
+.scroll{overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+#exp-table{min-width:1120px;font-size:13px}
+#exp-table th,#exp-table td{padding:8px 10px}
+th,td{padding:8px 12px;text-align:right;white-space:nowrap;
+  border-bottom:1px solid var(--rule)}
+th{font-size:11px;letter-spacing:.06em;color:var(--ink-3);font-weight:600;
+  background:var(--sunk);position:sticky;top:0}
+th:first-child,td:first-child{text-align:left}
+tbody tr:last-child td{border-bottom:none}
+tr.sum td{font-weight:700;background:var(--sunk);border-top:1.5px solid var(--rule-2)}
+td.zero{color:var(--ink-3)}
+td.mark{color:var(--ink-3);font-size:11px}
+
+/* ---- chart ---- */
+.chart{background:var(--surface);border:1px solid var(--rule);padding:16px 4px 6px;
+  position:relative}
+.hit{fill:transparent;cursor:crosshair}
+.hit:hover{fill:var(--ink);fill-opacity:.05}
+.tip{position:absolute;z-index:5;pointer-events:none;min-width:190px;
+  background:var(--surface);border:1px solid var(--rule-2);border-radius:4px;
+  padding:9px 12px;font-size:12.5px;line-height:1.6;
+  box-shadow:0 4px 16px rgba(0,0,0,.14);transform:translate(-50%,-100%)}
+.tip .m{font-weight:700;margin-bottom:4px;font-size:13px}
+.tip .l{display:flex;justify-content:space-between;gap:16px;color:var(--ink-2)}
+.tip .l i{display:inline-block;width:9px;height:9px;border-radius:2px;
+  margin-right:6px;vertical-align:-1px}
+.tip .l.t{border-top:1px solid var(--rule);margin-top:4px;padding-top:4px;
+  font-weight:700;color:var(--ink)}
+.tip .l span:last-child{font-family:"IBM Plex Mono",monospace;
+  font-variant-numeric:tabular-nums}
+.tip .none{color:var(--ink-3)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;
+  padding:0 14px 10px;color:var(--ink-2)}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:2px;
+  margin-right:6px;vertical-align:-1px}
+
+/* ---- simulator ---- */
+.sim{display:grid;gap:22px;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+@media(max-width:760px){.sim{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--rule);padding:18px}
+.ctrl{margin-bottom:19px}
+.ctrl:last-child{margin-bottom:0}
+.ctrl label{display:flex;justify-content:space-between;align-items:baseline;
+  gap:10px;font-size:13px;font-weight:500;margin-bottom:7px}
+.ctrl .out{font-weight:600;font-size:14.5px;color:var(--accent)}
+input[type=range]{width:100%;accent-color:var(--accent);height:22px;margin:0}
+.ctrl .hint{font-size:11.5px;color:var(--ink-3);margin-top:3px}
+.chk{display:flex;align-items:flex-start;gap:9px;font-size:13px;
+  cursor:pointer;margin-bottom:13px}
+.chk input{accent-color:var(--accent);margin-top:4px;flex:none}
+.chk:last-child{margin-bottom:0}
+.chk .hint{font-size:11.5px;color:var(--ink-3);display:block}
+button.reset{font:inherit;font-size:12px;background:none;cursor:pointer;
+  border:1px solid var(--rule-2);color:var(--ink-2);padding:5px 11px;
+  border-radius:3px;margin-top:16px}
+button.reset:hover{border-color:var(--ink-3);color:var(--ink)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- breakdown list ---- */
+.rows{font-size:13.5px}
+.minirows{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));
+  gap:0 34px;font-size:13px}
+.fig.act.inc .v{color:var(--indigo)}
+.row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;
+  border-bottom:1px solid var(--rule)}
+.row:last-child{border-bottom:none}
+.row.tot{border-top:1.5px solid var(--rule-2);margin-top:5px;padding-top:9px;
+  font-weight:700;font-size:15px;border-bottom:none}
+.row.tot .v{color:var(--seal)}
+.row.sub{padding-left:14px;color:var(--ink-2);font-size:12.5px}
+.row .v{font-weight:600}
+.row.neg .v{color:var(--moss)}
+h3.ph{font-size:12px;letter-spacing:.11em;color:var(--ink-3);
+  font-family:"Noto Sans JP",sans-serif;font-weight:700;
+  margin:20px 0 7px;padding-bottom:5px;border-bottom:1px solid var(--rule)}
+h3.ph:first-child{margin-top:0}
+
+/* ---- callouts ---- */
+.flags{display:grid;gap:11px}
+.flag{background:var(--surface);border:1px solid var(--rule);
+  border-left:3px solid var(--ochre);padding:12px 15px;font-size:13px}
+.flag.warn{border-left-color:var(--seal)}
+.flag.ok{border-left-color:var(--moss)}
+.flag b{display:block;font-size:13px;margin-bottom:2px}
+.flag span{color:var(--ink-2);font-size:12.5px}
+footer{margin-top:44px;padding-top:15px;border-top:1px solid var(--rule);
+  font-size:11.5px;color:var(--ink-3)}
+footer code{background:var(--sunk);padding:1px 5px;border-radius:3px;
+  font-family:"IBM Plex Mono",monospace;font-size:11px}
+img{max-width:100%}
+[hidden]{display:none!important}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<header>
+  <div>
+    <div class="eyebrow" id="eyebrow"></div>
+    <h1>確定申告シミュレーター</h1>
+  </div>
+  <div class="stamp" id="stamp"></div>
+</header>
+
+<section id="s-actual">
+  <div class="shead"><h2>実績</h2>
+    <div class="note" id="actual-note"></div></div>
+  <div class="figs" id="figs-actual"></div>
+  <div class="panel" style="margin-top:14px">
+    <div class="minirows" id="actual-detail"></div>
+  </div>
+</section>
+
+<section id="s-top">
+  <div class="shead"><h2>年間着地の見込み</h2>
+    <div class="note">末尾のシミュレーターの設定を反映</div></div>
+  <div class="figs" id="figs"></div>
+</section>
+
+<section id="s-sales">
+  <div class="shead"><h2>売上</h2><div class="note" id="sales-note"></div></div>
+  <div class="chart">
+    <div class="legend" id="sales-legend"></div>
+    <div id="sales-chart"></div>
+    <div class="tip" id="sales-tip" hidden></div>
+  </div>
+  <div class="scroll" style="margin-top:14px"><table id="sales-table"></table></div>
+</section>
+
+<section id="s-exp">
+  <div class="shead"><h2>経費</h2>
+    <div class="note">管理台帳_<span class="y"></span>.csv の集計</div></div>
+  <div class="scroll"><table id="exp-table"></table></div>
+</section>
+
+<section id="s-ded">
+  <div class="shead"><h2>所得控除の内訳</h2>
+    <div class="note">確定申告サマリー・寄付金CSVの値</div></div>
+  <div class="panel"><div class="rows" id="ded-rows"></div></div>
+</section>
+
+<section id="s-flags">
+  <div class="shead"><h2>未確定・要確認</h2></div>
+  <div class="flags" id="flags"></div>
+</section>
+
+<section id="s-params">
+  <div class="shead"><h2>税制パラメータ（令和8年分）</h2>
+    <div class="note">計算の根拠。使う前にその年分の資料で確かめる</div></div>
+  <div class="scroll"><table id="param-table"></table></div>
+</section>
+
+<section id="s-sim">
+  <div class="shead"><h2>シミュレーション</h2>
+    <div class="note">未確定の前提を動かして税額を見る</div></div>
+  <div class="sim">
+    <div class="panel" id="controls"></div>
+    <div class="panel" id="breakdown"></div>
+  </div>
+</section>
+
+<footer id="footer"></footer>
+</div>
+
+<script>
+const D = /*__DATA__*/null;
+const yen = n => "¥" + Math.round(n).toLocaleString("ja-JP");
+const man = n => (n/10000).toFixed(0) + "万";
+const el = id => document.getElementById(id);
+
+/* ---------- 税額計算（速算表・復興特別所得税の率は scripts/tax_rules.py から埋め込む） ---------- */
+const bracket = k => D.tax.table.find(([lim]) => lim === null || k <= lim);
+function incomeTax(k){
+  const [, r, d] = bracket(k);
+  return Math.floor(k*r/100) - d;
+}
+const withReconstruction = t => Math.floor((t + Math.floor(t*D.tax.reconstructionPermille/1000))/100)*100;
+/* 簡易課税（みなし仕入率は scripts/tax_rules.py の DEEMED_PURCHASE_RATE。帳簿の転記シートと同じ式） */
+function consumptionTax(grossInclusive){
+  const base = Math.floor(Math.floor(grossInclusive*100/110)/1000)*1000;
+  const tax = Math.floor(base*78/1000);
+  const national = Math.floor((tax - Math.floor(tax*D.tax.deemedPurchaseRate/100))/100)*100;
+  const local = Math.floor(national*22/78/100)*100;
+  return {base, national, local, total: national+local};
+}
+const bracketLabel = k => bracket(k)[1] + "%";
+
+/* いまの税率の区分の下限を何円超えているか（いちばん低い区分なら null） */
+function lowerBracketGap(k){
+  const i = D.tax.table.findIndex(([lim]) => lim === null || k <= lim);
+  return i > 0 ? {over: k - D.tax.table[i-1][0], limit: D.tax.table[i-1][0], lower: D.tax.table[i-1][1]} : null;
+}
+
+/* 所得税・住民税。所得控除の額はサマリーの値、寄附は所得税では所得控除・住民税では税額控除 */
+function taxes(income, shakai, kakekin, furusato){
+  const kifu = Math.max(0, Math.min(furusato, Math.floor(income*0.4)) - 2000);  /* 寄附金は総所得金額等の40%が上限 */
+  const dedI = shakai + DED.iryo + kifu + kakekin + DED.fuyo + DED.kiso;
+  const taxableI = Math.max(0, Math.floor((income - dedI)/1000)*1000);
+  /* 復興特別所得税2.1%。令和9年分から防衛特別1.0%＋復興1.1%になるが合計は2.1%のまま */
+  const shotoku = withReconstruction(incomeTax(taxableI));
+  const rate = bracket(taxableI)[1];
+
+  /* 住民税: 基礎控除・扶養控除は所得税と額が違う（scripts/build_dashboard.py の JUMIN とサマリー） */
+  const J = D.tax.jumin;
+  const dedR = shakai + DED.iryo + kakekin + DED.fuyoR + J.kiso;
+  const taxableR = Math.max(0, Math.floor((income - dedR)/1000)*1000);
+  const shotokuwari = Math.max(0, Math.floor(taxableR*J.rate/100) - J.adjust);
+  /* ふるさと納税: 基本分10%＋特例分 (寄附−2,000)×(90%−所得税率×102.1%)。特例分は所得割の20%が上限 */
+  const special = 0.9 - rate/100*(1 + D.tax.reconstructionPermille/1000);
+  const fBasic = Math.floor(kifu*0.10);
+  const fSpecialRaw = Math.floor(kifu*special);
+  const cap = Math.floor(shotokuwari*0.20);
+  const fSpecial = Math.min(fSpecialRaw, cap);
+  const jumin = Math.max(0, shotokuwari - fBasic - fSpecial) + J.kintou;
+  return {kifu, dedI, taxableI, shotoku, taxableR, jumin, fBasic, fSpecial,
+          fCapped: fSpecialRaw > cap, furusatoCap: Math.floor(cap/special) + 2000,
+          bracket: bracketLabel(taxableI), toLowerBracket: lowerBracketGap(taxableI)};
+}
+
+function simulate(p){
+  const sales = p.postedSales + p.futureMonthly * p.futureMonths;
+  const ct = consumptionTax(sales);
+  const variable = p.variableMonthly * 12;
+  /* 今年分の消費税（ct）は来年の経費なので入れない。前年分の納付は手入力仕訳に入っている */
+  const expenses = variable + p.rentMonthly*12 + p.recurring + MN.total + p.depreciation;
+  const income = sales - expenses - p.aoiro;
+  const t = taxes(income, p.shakai, p.kakekin, p.furusato);
+  const total = t.shotoku + t.jumin + ct.total;
+  return {sales, ct, variable, expenses, income, ...t, total,
+          net: income + p.aoiro - total, shakai: p.shakai, kakekin: p.kakekin};
+}
+
+/* ---------- 実績から既定値を作る ---------- */
+const S = D.sales, DED = D.deductions, RC = D.recurring, MN = D.manual;
+const postedMonths = S.lastMonth;  /* 1月から、売上を計上済みの最終月まで */
+const futureMonths = 12 - postedMonths;
+const avgSales = postedMonths ? Math.round(S.total/postedMonths) : 0;
+
+/* 変動費（台帳計上分）の月平均。家事分を含む科目（水道光熱費など）は按分後で数える */
+let variableToDate = 0;
+for(const c of D.expenseCats){
+  const sum = c.monthly.slice(0, postedMonths).reduce((a,b)=>a+b,0);
+  variableToDate += c.prorate != null ? Math.round(sum*c.prorate/100) : sum;
+}
+const avgVariable = postedMonths ? Math.round(variableToDate/postedMonths) : 0;
+
+/* 残り月の売上見込み: 売上先ごとの1–N月平均を、終了月度までの月数だけ積む */
+const clientAvg = S.clients.map((_,i)=>postedMonths ? Math.round(
+  S.months.filter(m=>m.total>0).reduce((a,m)=>a+m.values[i],0)/postedMonths) : 0);
+const clientFutureMonths = S.endMonth.map(e=>Math.max(0, (e ?? 12) - S.lastMonth));
+const futureSales = clientAvg.reduce((a,v,i)=>a + v*clientFutureMonths[i], 0);
+const endNote = S.clients.map((c,i)=>S.endMonth[i] ? `${c}は${S.endMonth[i]}月度で終了` : null)
+  .filter(Boolean).join("・");
+
+const DEFAULTS = {
+  futureMonthly: futureMonths ? Math.round(futureSales/futureMonths) : 0,
+  variableMonthly: avgVariable,
+  kakekin: DED.kakekin,
+  furusato: D.furusato.total,
+};
+const state = {...DEFAULTS};
+
+function params(){
+  return {
+    postedSales: S.total, futureMonths, futureMonthly: state.futureMonthly,
+    variableMonthly: state.variableMonthly,
+    rentMonthly: DED.rentMonth, recurring: RC.projected,
+    depreciation: DED.genka, aoiro: DED.aoiro,
+    shakai: DED.shakai, kakekin: state.kakekin, furusato: state.furusato,
+  };
+}
+
+/* ---------- 実績（売上の確定月に期間を揃える） ---------- */
+function actuals(){
+  const m = S.lastMonth;
+  const ct = consumptionTax(S.total);
+  const rent = DED.rentMonth * m;
+  const recurring = Object.entries(RC.monthly).filter(([k]) => +k <= m).reduce((a,[,v])=>a+v, 0);
+  const manual = Object.entries(MN.monthly).filter(([k]) => +k <= m).reduce((a,[,v])=>a+v, 0);
+  const expenses = variableToDate + rent + recurring + manual + DED.genka;
+  const income = S.total - expenses - DED.aoiro;
+  /* 所得控除はサマリーに入れた額（今日までに払った分）、寄附は寄付金CSVの合計で計算する */
+  const t = taxes(income, DED.shakai, DED.kakekin, D.furusato.total);
+  const total = t.shotoku + t.jumin + ct.total;
+  return {months:m, sales:S.total, ct, rent, recurring, manual, expenses, income, ...t, total,
+          net: income + DED.aoiro - total};
+}
+
+function renderActual(){
+  const a = actuals();
+  el("actual-note").textContent =
+    `1–${a.months}月 / 経費は売上と同じ期間で揃えている`;
+  el("figs-actual").innerHTML = [
+    ["売上（税込）", yen(a.sales), `請求書 ${a.months}ヶ月分`, ""],
+    ["経費合計", yen(a.expenses), `手入力仕訳 ${yen(a.manual)} を含む`, ""],
+    ["事業所得", yen(a.income), `課税所得 ${yen(a.taxableI)}・税率${a.bracket}`, ""],
+    ["税負担合計", yen(a.total), "所得税＋住民税＋消費税", "tax"],
+    ["手残り", yen(a.net), `実効負担率 ${(a.total/a.sales*100).toFixed(1)}%`, "hl"],
+  ].map(([k,v,sub,c])=>
+    `<div class="fig ${c}"><div class="k">${k}</div>
+     <div class="v num">${v}</div><div class="s">${sub}</div></div>`).join("");
+
+  const r = (k,v,cls="") =>
+    `<div class="row ${cls}"><span>${k}</span><span class="v num">${v}</span></div>`;
+  el("actual-detail").innerHTML =
+    `<div>
+      <h3 class="ph">所得の計算</h3>
+      ${r("売上（税込）", yen(a.sales))}
+      ${r("台帳計上の経費", "−"+yen(variableToDate), "neg")}
+      ${r("地代家賃（按分後）", "−"+yen(a.rent), "neg")}
+      ${r("定期経費（領収書なし）", "−"+yen(a.recurring), "neg")}
+      ${r("減価償却費（年額）", "−"+yen(DED.genka), "neg")}
+      ${r("手入力仕訳（前年分の消費税など）", "−"+yen(a.manual), "neg")}
+      ${r("青色申告特別控除", "−"+yen(DED.aoiro), "neg")}
+      ${r("事業所得", yen(a.income), "tot")}
+     </div>
+     <div>
+      <h3 class="ph">所得控除</h3>
+      ${r("社会保険料控除", yen(DED.shakai))}
+      ${r("小規模企業共済等掛金控除", yen(DED.kakekin))}
+      ${r("医療費控除", yen(DED.iryo))}
+      ${r("寄附金控除", yen(a.kifu))}
+      ${r("扶養控除", yen(DED.fuyo))}
+      ${r("基礎控除", yen(DED.kiso))}
+      ${r("所得控除 合計", yen(a.dedI), "tot")}
+     </div>
+     <div>
+      <h3 class="ph">税額</h3>
+      ${r("課税所得", yen(a.taxableI))}
+      ${r(`所得税＋復興特別（${a.bracket}）`, yen(a.shotoku))}
+      ${r("住民税", yen(a.jumin))}
+      ${r("消費税", yen(a.ct.total))}
+      ${r("合計", yen(a.total), "tot")}
+      <div class="flag" style="margin-top:14px">
+        <b>期中の参考値です</b>
+        <span>所得控除は確定申告サマリーに入れた額（今日までに払った分）で計算しています。
+        年末までに払う社会保険料などが増えると、税額は下がります。</span>
+      </div>
+     </div>`;
+}
+
+/* ---------- 見出し ---------- */
+el("eyebrow").textContent = `${D.year}年分（令和${D.year - 2018}年分）個人事業`;
+el("stamp").innerHTML = `売上確定<br>1–${S.lastMonth}月`;
+document.querySelectorAll(".y").forEach(e=>e.textContent=D.year);
+el("sales-note").textContent =
+  `税込・請求書ベース / 1–${S.lastMonth}月 実績 ${yen(S.total)}`;
+
+/* ---------- 上部の数値 ---------- */
+function renderFigs(r){
+  el("figs").innerHTML = [
+    ["売上（税込）", yen(r.sales), `1–${S.lastMonth}月実績＋${futureMonths}ヶ月見込${endNote ? `（${endNote}）` : ""}`, ""],
+    ["経費合計", yen(r.expenses), `手入力仕訳 ${yen(MN.total)} を含む`, ""],
+    ["事業所得", yen(r.income), `課税所得 ${yen(r.taxableI)}・税率${r.bracket}`, ""],
+    ["税負担合計", yen(r.total), "所得税＋住民税＋消費税", "tax"],
+    ["手残り", yen(r.net), `実効負担率 ${(r.total/r.sales*100).toFixed(1)}%`, "hl"],
+  ].map(([k,v,s,c])=>
+    `<div class="fig ${c}"><div class="k">${k}</div>
+     <div class="v num">${v}</div><div class="s">${s}</div></div>`).join("");
+}
+
+/* ---------- コントロール ---------- */
+const R0 = simulate(params());
+const CONTROLS = [
+  {id:"futureMonthly", label:`${S.lastMonth+1}–12月の月平均売上`, min:0,
+   max:Math.max(2500000, Math.round(avgSales*1.6/100000)*100000), step:10000,
+   fmt:yen, hint:()=>`1–${S.lastMonth}月の月平均は ${yen(avgSales)}` +
+     (endNote ? `。${endNote}として既定値を計算（売上先ごとの月平均×終了月度までの月数）` : "")},
+  {id:"variableMonthly", label:"経費の月平均（会議費・雑費など）", min:0,
+   max:Math.max(400000, Math.round(avgVariable*2.5/10000)*10000), step:5000,
+   fmt:yen, hint:()=>`1–${S.lastMonth}月の月平均は ${yen(avgVariable)}（家事分を含む科目は按分後）`},
+  {id:"kakekin", label:"小規模企業共済等掛金控除（年額）", min:0,
+   max:Math.max(1000000, Math.round(DED.kakekin*2/10000)*10000), step:1000,
+   fmt:yen, hint:()=>`確定申告サマリーの額は ${yen(DED.kakekin)}。掛金の上限は制度と加入の区分で決まる`},
+  {id:"furusato", label:"ふるさと納税 年間寄附額", min:0,
+   max:Math.max(400000, Math.round(R0.furusatoCap*1.8/10000)*10000), step:1000,
+   fmt:yen, hint:r=>r.fCapped
+     ? "⚠ 特例分が住民税所得割の20%上限を超えています（自己負担が増える）"
+     : `この前提での上限の目安 ${yen(r.furusatoCap)}（寄付金CSVの実績 ${yen(D.furusato.total)}）`},
+];
+
+function renderControls(r){
+  el("controls").innerHTML =
+    `<h3 class="ph">前提を動かす</h3>` +
+    CONTROLS.map(c=>`
+      <div class="ctrl">
+        <label for="${c.id}"><span>${c.label}</span>
+          <span class="out num" id="out-${c.id}">${c.fmt(state[c.id])}</span></label>
+        <input type="range" id="${c.id}" min="${c.min}" max="${c.max}"
+               step="${c.step}" value="${state[c.id]}">
+        <div class="hint" id="hint-${c.id}">${c.hint(r)}</div>
+      </div>`).join("") +
+    `<button class="reset" id="reset">実績どおりに戻す</button>`;
+
+  for(const c of CONTROLS){
+    el(c.id).addEventListener("input", e=>{
+      state[c.id] = +e.target.value; update();
+    });
+  }
+  el("reset").addEventListener("click", ()=>{
+    Object.assign(state, DEFAULTS); renderControls(simulate(params())); update();
+  });
+}
+
+function syncControls(r){
+  for(const c of CONTROLS){
+    const input = el(c.id); if(!input) continue;
+    if(+input.value !== state[c.id]) input.value = state[c.id];
+    el("out-"+c.id).textContent = c.fmt(state[c.id]);
+    el("hint-"+c.id).textContent = c.hint(r);
+  }
+}
+
+/* ---------- 内訳 ---------- */
+function renderBreakdown(r){
+  const row = (k,v,cls="") =>
+    `<div class="row ${cls}"><span>${k}</span><span class="v num">${v}</span></div>`;
+  el("breakdown").innerHTML =
+    `<h3 class="ph">所得の計算</h3><div class="rows">
+      ${row("売上（税込）", yen(r.sales))}
+      ${row("経費", "−"+yen(r.expenses), "neg")}
+      ${row("　手入力仕訳（前年分の消費税など）", yen(MN.total), "sub")}
+      ${row("　定期経費（領収書なし）", yen(RC.projected), "sub")}
+      ${row("　地代家賃（按分後）", yen(DED.rentMonth*12), "sub")}
+      ${row("　減価償却費", yen(DED.genka), "sub")}
+      ${row("　その他（台帳の経費）", yen(r.variable), "sub")}
+      ${row("青色申告特別控除", "−"+yen(DED.aoiro), "neg")}
+      ${row("事業所得", yen(r.income))}
+     </div>
+     <h3 class="ph">所得控除</h3><div class="rows">
+      ${row("社会保険料控除", yen(r.shakai))}
+      ${row("小規模企業共済等掛金控除", yen(r.kakekin))}
+      ${row("医療費控除", yen(DED.iryo))}
+      ${row("寄附金控除", yen(r.kifu))}
+      ${row("扶養控除", yen(DED.fuyo))}
+      ${row("基礎控除", yen(DED.kiso))}
+      ${row("課税所得（所得税）", yen(r.taxableI))}
+     </div>
+     <h3 class="ph">税額</h3><div class="rows">
+      ${row(`所得税＋復興特別（税率${r.bracket}）`, yen(r.shotoku))}
+      ${row("住民税", yen(r.jumin))}
+      ${row("消費税", yen(r.ct.total))}
+      ${row("合計", yen(r.total), "tot")}
+     </div>`;
+}
+
+/* ---------- 売上チャート ---------- */
+const PALETTE = ["var(--indigo)","var(--ochre)","var(--moss)","var(--seal)"];
+function renderSalesChart(){
+  const W=920, H=210, padL=52, padR=10, padT=10, padB=28;
+  const n=12, iw=W-padL-padR, ih=H-padT-padB;
+  const bw = iw/n*0.62, step = iw/n;
+  const max = Math.max(...S.months.map(m=>m.total), 1);
+  const tick = Math.ceil(max/4/100000)*100000;
+  let g = "";
+  for(let v=0; v<=max*1.05; v+=tick){
+    const y = padT+ih-(v/ (tick*Math.ceil(max*1.05/tick)))*ih;
+    g += `<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"
+            stroke="var(--rule)" stroke-width="1"/>
+          <text x="${padL-8}" y="${y+4}" text-anchor="end" font-size="11"
+            fill="var(--ink-3)" font-family="IBM Plex Mono,monospace">${man(v)}</text>`;
+  }
+  const top = tick*Math.ceil(max*1.05/tick);
+  let bars = "";
+  S.months.forEach((m,i)=>{
+    const x = padL + step*i + (step-bw)/2;
+    let acc = 0;
+    m.values.forEach((v,ci)=>{
+      if(!v) return;
+      const h = v/top*ih, y = padT+ih-acc-h; acc += h;
+      bars += `<rect x="${x}" y="${y}" width="${bw}" height="${h}"
+                 fill="${PALETTE[ci%PALETTE.length]}"
+                 opacity="${m.total?1:.25}"/>`;
+    });
+    if(!m.total){
+      bars += `<rect x="${x}" y="${padT+ih-3}" width="${bw}" height="3"
+                 fill="var(--rule-2)"/>`;
+    }
+    bars += `<text x="${x+bw/2}" y="${H-9}" text-anchor="middle" font-size="11"
+               fill="var(--ink-3)">${m.month}</text>`;
+  });
+  let hits = "";
+  S.months.forEach((m,i)=>{
+    hits += `<rect class="hit" data-i="${i}" x="${padL+step*i}" y="${padT}"
+               width="${step}" height="${ih}"/>`;
+  });
+  el("sales-chart").innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img"
+       aria-label="月別売上の推移。金額は下の表を参照">${g}${bars}${hits}</svg>`;
+  wireTooltip();
+  el("sales-legend").innerHTML = S.clients.map((c,i)=>
+    `<span><i style="background:${PALETTE[i%PALETTE.length]}"></i>${c}</span>`)
+    .join("") + `<span><i style="background:var(--rule-2)"></i>未計上</span>`;
+}
+
+function wireTooltip(){
+  const tip = el("sales-tip"), chart = document.querySelector(".chart");
+  const show = (i, ev) => {
+    const m = S.months[i];
+    tip.innerHTML = `<div class="m">${m.month}月</div>` + (m.total
+      ? m.values.map((v,ci)=>
+          `<div class="l"><span><i style="background:${
+            PALETTE[ci%PALETTE.length]}"></i>${S.clients[ci]}</span>
+           <span>${v?yen(v):"—"}</span></div>`).join("")
+        + `<div class="l t"><span>合計</span><span>${yen(m.total)}</span></div>`
+      : `<div class="none">未計上</div>`);
+    const box = chart.getBoundingClientRect();
+    tip.hidden = false;
+    const w = tip.offsetWidth;
+    let x = ev.clientX - box.left;
+    x = Math.min(Math.max(x, w/2 + 6), box.width - w/2 - 6);
+    tip.style.left = x + "px";
+    tip.style.top = (ev.clientY - box.top - 14) + "px";
+  };
+  chart.querySelectorAll(".hit").forEach(r=>{
+    const i = +r.dataset.i;
+    r.addEventListener("pointermove", e=>show(i, e));
+    r.addEventListener("pointerenter", e=>show(i, e));
+    r.addEventListener("pointerleave", ()=>{ tip.hidden = true; });
+  });
+  chart.addEventListener("pointerleave", ()=>{ tip.hidden = true; });
+}
+
+/* ---------- 売上テーブル ---------- */
+function renderSalesTable(){
+  const head = `<thead><tr><th>月</th>${
+    S.clients.map(c=>`<th>${c}</th>`).join("")}<th>合計</th></tr></thead>`;
+  const body = S.months.map(m=>{
+    const z = m.total ? "" : ' class="zero"';
+    return `<tr><td>${m.month}月</td>${
+      m.values.map(v=>`<td class="num${v?'':' zero'}">${v?yen(v):"—"}</td>`).join("")
+    }<td class="num"${z}>${m.total?yen(m.total):"—"}</td></tr>`;
+  }).join("");
+  const tot = `<tr class="sum"><td>1–${S.lastMonth}月 計</td>${
+    S.clients.map((_,i)=>`<td class="num">${yen(
+      S.months.reduce((a,m)=>a+m.values[i],0))}</td>`).join("")
+  }<td class="num">${yen(S.total)}</td></tr>`;
+  el("sales-table").innerHTML = head + `<tbody>${body}${tot}</tbody>`;
+}
+
+/* ---------- 経費テーブル ---------- */
+function renderExpenses(){
+  const cats = [...D.expenseCats].sort((a,b)=>b.total-a.total);
+  const head = `<thead><tr><th>勘定科目</th>${
+    D.months.map(m=>`<th>${m.replace("月","")}</th>`).join("")
+  }<th>年間計</th></tr></thead>`;
+  const body = cats.map(c=>
+    `<tr><td>${c.name}${c.prorate != null ? `<span class="mark"> ※按分前（事業分${c.prorate}%）</span>` : ""}</td>${
+      c.monthly.map(v=>`<td class="num${v?'':' zero'}">${
+        v?v.toLocaleString("ja-JP"):"—"}</td>`).join("")
+    }<td class="num">${yen(c.total)}</td></tr>`).join("");
+  const tot = `<tr class="sum"><td>合計</td>${
+    D.months.map((_,i)=>{
+      const v = cats.reduce((a,c)=>a+c.monthly[i],0);
+      return `<td class="num${v?'':' zero'}">${v?v.toLocaleString("ja-JP"):"—"}</td>`;
+    }).join("")
+  }<td class="num">${yen(cats.reduce((a,c)=>a+c.total,0))}</td></tr>`;
+  el("exp-table").innerHTML = head + `<tbody>${body}${tot}</tbody>`;
+}
+
+/* ---------- 控除内訳 ---------- */
+function renderDeductions(){
+  const row=(k,v,cls="")=>
+    `<div class="row ${cls}"><span>${k}</span><span class="v num">${yen(v)}</span></div>`;
+  el("ded-rows").innerHTML =
+    row("社会保険料控除", DED.shakai) +
+    row("小規模企業共済等掛金控除", DED.kakekin) +
+    row("医療費控除（10万円などを差し引いた後）", DED.iryo) +
+    row(`ふるさと納税など（寄付金CSV ${D.furusato.count}件）`, D.furusato.total) +
+    row("扶養控除（所得税）", DED.fuyo) +
+    row("基礎控除（所得税）", DED.kiso);
+}
+
+function renderParams(){
+  const src = v => v==="csv"
+    ? '<span class="mark">CSV</span>'
+    : '<span class="mark">コード内</span>';
+  const rows = [
+    ["所得税の速算表", D.tax.table.length + "段階 " + D.tax.table[0][1] + "%〜" + D.tax.table.at(-1)[1] +
+      "%（" + D.tax.table.filter(([l]) => l).map(([l]) => (l/10000).toLocaleString("ja-JP")).join("/") +
+      "万円で区切り）", "code"],
+    ["復興特別所得税", "所得税額 × " + D.tax.reconstructionPermille/10 + "%", "code"],
+    ["基礎控除（所得税）", yen(DED.kiso) + "（合計所得金額で変わる）", "csv"],
+    ["基礎控除（住民税）", yen(D.tax.jumin.kiso), "code"],
+    ["扶養控除（所得税）", yen(DED.fuyo), "csv"],
+    ["扶養控除（住民税）", yen(DED.fuyoR), "csv"],
+    ["住民税 所得割", "課税所得 × " + D.tax.jumin.rate + "%", "code"],
+    ["住民税 調整控除", "−" + yen(D.tax.jumin.adjust) + "（簡略化。課税所得200万円超）", "code"],
+    ["住民税 均等割", yen(D.tax.jumin.kintou) + "（標準。森林環境税1,000円を含む。自治体によって加算がある）", "code"],
+    ["ふるさと納税 特例分", "(寄附額−2,000) × (90% − 所得税率 × 102.1%)", "code"],
+    ["　　〃　　 上限", "住民税所得割の20%", "code"],
+    ["消費税", "簡易課税・みなし仕入率" + D.tax.deemedPurchaseRate + "%（国税7.8%、地方は国税×22/78）", "code"],
+    ["青色申告特別控除", yen(DED.aoiro), "csv"],
+    ["個人事業税", "計算に入れていない（業種によって課税される）", "code"],
+  ];
+  el("param-table").innerHTML =
+    `<thead><tr><th>項目</th><th style="text-align:left">内容</th>
+      <th>取得元</th></tr></thead><tbody>` +
+    rows.map(([k,v,o])=>
+      `<tr><td>${k}</td><td style="text-align:left;white-space:normal">${v}</td>
+       <td>${src(o)}</td></tr>`).join("") +
+    `<tr class="sum"><td>確認</td>
+      <td style="text-align:left;white-space:normal">令和8年分の値。使う前に、その年分の国税庁・自治体の資料で確かめる。
+      防衛特別所得税は令和9年分からで、復興特別所得税と合わせた率は2.1%のまま</td><td></td></tr></tbody>`;
+}
+
+/* ---------- 要確認 ---------- */
+function renderFlags(r){
+  const f = [];
+  const g = r.toLowerBracket;
+  if(g && g.over < 1000000){
+    f.push(["warn", `所得税の税率が${r.bracket}の区分に入っています`,
+      `課税所得が${man(g.limit)}円を ${yen(g.over)} 超えています。所得控除を増やして
+       ${man(g.limit)}円以下に収めると、税率が${g.lower}%に下がります。`]);
+  }
+  if(r.fCapped){
+    f.push(["warn", "ふるさと納税が控除上限を超えています",
+      "特例分が住民税所得割の20%を超えたため、超過分は自己負担になります。"]);
+  }
+  f.push(["", "今年分の消費税は来年の経費",
+    `税込経理では、消費税は納めた年の経費（租税公課）です。今年分の見込み ${yen(r.ct.total)} は
+     税負担に入れていますが、今年の経費には入れていません（帳簿と同じ）。前年分の納付は手入力仕訳から入れています。`]);
+  f.push(["", "領収書が届かない項目は証明書で確かめる",
+    "定期経費・掛金・社会保険料は、年末の払込証明書や控除証明書、通帳と照合してください。"]);
+  f.push(["ok", `簡易課税（みなし仕入率${D.tax.deemedPurchaseRate}%）を適用`,
+    `課税標準 ${yen(r.ct.base)} × 7.8% × ${100 - D.tax.deemedPurchaseRate}% ＝ 国税 ${yen(r.ct.national)}、
+     地方消費税 ${yen(r.ct.local)}。`]);
+  el("flags").innerHTML = f.map(([c,t,d])=>
+    `<div class="flag ${c}"><b>${t}</b><span>${d}</span></div>`).join("");
+}
+
+/* ---------- 更新 ---------- */
+function update(){
+  const r = simulate(params());
+  renderFigs(r); renderBreakdown(r); syncControls(r); renderFlags(r);
+}
+
+renderActual(); renderSalesChart(); renderSalesTable(); renderExpenses(); renderDeductions(); renderParams();
+renderControls(simulate(params()));
+update();
+
+el("footer").innerHTML =
+  `生成 ${D.generated} ／ <code>python3 scripts/build_dashboard.py</code> で再生成。
+   売上・経費・控除はすべてこのリポジトリのCSVから読み込んでいます。
+   税額は概算です（所得税は復興特別所得税2.1%込み、住民税は所得割＋均等割だけ、
+   個人事業税は計算に入れていない）。最終的な申告額は申告書作成時に確定してください。`;
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
